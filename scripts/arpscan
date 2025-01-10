@@ -1,0 +1,153 @@
+#!/bin/bash
+
+# Configuration file path
+CONFIG_FILE="vlans.conf"
+
+# Function to check if arpscan is installed
+check_arpscan() {
+  if ! command -v arp-scan &> /dev/null; then
+    echo "Error: arp-scan is not installed. Please install it (e.g., sudo apt install arp-scan)."
+    return 1
+  fi
+  return 0
+}
+
+# Function to clear the ARP cache
+clear_arp_cache() {
+  sudo ip -s -s neigh flush all
+  if [[ $? -ne 0 ]]; then
+    echo "Error clearing ARP cache."
+    return 1
+  fi
+  echo "ARP cache cleared."
+  return 0
+}
+
+# Function to connect to a VLAN using NetworkManager
+connect_to_vlan() {
+  local vlan_id="$1"
+  local vlan_name="vlan${vlan_id}"
+
+  nmcli con up "$vlan_name"
+  if [[ $? -ne 0 ]]; then
+    nmcli con show "$vlan_name"
+    echo "Error connecting to VLAN: $vlan_name (ID: $vlan_id). Check if the connection exists and is configured correctly."
+    return 1
+  fi
+  echo "Connected to VLAN: $vlan_name (ID: $vlan_id)"
+  sleep 5 # Wait for connection to fully establish
+  return 0
+}
+
+# Function to perform ARP scan and save results (OFFLINE SAFE)
+arp_scan_vlan() {
+  local vlan_id="$1"
+  local output_file="vlan${vlan_id}.txt"
+  local vlan_name="vlan${vlan_id}"
+
+  #  Connect to the VLAN (ensure it's active)
+  if ! connect_to_vlan "$vlan_id"; then
+    echo "Error connecting to VLAN $vlan_name. Cannot proceed with the scan."
+    return 1
+  fi
+
+  # Get the interface associated with the VLAN connection (OFFLINE SAFE)
+  #interface=$(nmcli -g DEVICE con show "$vlan_name")
+  interface=$(nmcli device | grep vlan | awk '{ print $1 }')
+
+  if [[ -z "$interface" ]]; then
+    echo "Error: Could not determine interface for VLAN $vlan_name (ID: $vlan_id) after connection. Check VLAN configuration status in NetworkManager."
+    nmcli con down "$vlan_name" # Disconnect if there is an issue to prevent errors.
+    return 1
+  fi
+
+  # Wait for IP address to be assigned to the interface (Crucial for DHCP).
+  for i in {1..10}; do # Try up to 10 times (adjust as needed).
+    ip_address=$(ip -4 addr show "$interface" | grep "inet\b" | awk '{print $2}' | cut -d/ -f1)
+    if [[ ! -z "$ip_address" ]]; then
+      break # IP address not found. Exit the loop.
+    fi
+    sleep 1 # Wait 1 second before trying again.
+  done
+
+  if [[ -z "$ip_address" ]]; then
+    echo "Error: No IP address assigned to interface $interface after multiple retries. Check DHCP or static IP configuration for VLAN $vlan_name."
+    nmcli con down "$vlan_name" # Disconnect if there is an issue to prevent errors.
+    return 1
+  fi
+
+  # Determine the network range using the obtained IP.
+  network_range=$(ipcalc "$ip_address" | grep Network | awk '{print $2}')
+  if [[ -z "$network_range" ]]; then
+    echo "ERROR: Could not determine network range for VLAN $vlan_name (ID: $vlan_id) from IP address. Ensure ipcalc is installed."
+    nmcli con down "$vlan_name" # Disconnect if there is an issue to prevent errors .
+    return 1
+  fi
+
+  echo "Scanning interface: $interface (IP: $ip_address, Network: $network_range)"
+  arp-scan -I "$interface" "$network_range" > "$output_file" # Scan the whole subnet.
+  if [[ $? -ne 0 ]]; then
+    echo "Error performing ARP scan on VLAN: $vlan_name (ID: $vlan_id)"
+    nmcli con down "$vlan_name" # Disconnect if there is an issue to prevent errors.
+    return 1
+  fi
+  echo "ARP scan results saved to: $output_file"
+  nmcli con down "$vlan_name" # Disconnect after the scan.
+  return 0
+}
+
+# Main script execution
+
+# Check for arpscan installation
+if check_arpscan; then
+  : # arpscan is installed, continue
+else
+  exit 1
+fi
+
+# Check if config file exists
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Error: Configuration file '$CONFIG_FILE' not found."
+  exit 1
+fi
+
+# Parse the config file (more flexible format)
+while IFS=$'\n' read -r line; do
+  IFS=',' read -r -a vlan_ids <<< "$line"
+  for vlan_id in "${vlan_ids[@]}"; do
+    vlan_id=$(echo "$vlan_id" | xargs) # Trim whitespace
+    #Skip empty lines
+    if [[ -z "$vlan_id" ]]; then
+        continue
+    fi
+    # Input Validation: Check if $vlan_id is a number
+    if ! [[ "$vlan_id" =~ ^[0-9]+$ ]]; then
+        echo "Warning: Invalid VLAN ID '$vlan_id' in config file. Must be a number. Skipping."
+        continue # Skip to the next VLAN ID
+    fi
+
+    echo "Processing VLAN ID: $vlan_id"
+    # Connect to VLAN BEFORE checking the ARP cache and scanning.
+    if connect_to_vlan "$vlan_id"; then # Connect to vlan before anything.
+        if clear_arp_cache; then # Clear ARP cache before scanning
+            if arp_scan_vlan "$vlan_id"; then
+              nmcli con down "vlan${vlan_id}" # Disconnect after successful scan
+            else
+              nmcli con down "vlan${vlan_id}" # Disconnect on scan error
+            fi
+        else
+            echo "Warning: Failed to clear ARP Cache, continuing with scan but results may be inaccurate"
+             if arp_scan_vlan "$vlan_id"; then
+              nmcli con down "vlan${vlan_id}" # Disconnect after successful scan
+            else
+              nmcli con down "vlan${vlan_id}" # Disconnect on scan error
+            fi
+        fi
+    else
+      echo "Failed to process VLAN ID: $vlan_id"
+    fi
+  done
+done < "$CONFIG_FILE"
+
+echo "Scan Complete"
+exit 0
